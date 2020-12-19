@@ -96,7 +96,7 @@ float* mh_v1(float x0, int N, int burn_N, double (*f)(float), int seed) {
 
 
 
-int main()
+extern "C" int cuda_main()
 {
     const int arraySize = 5;
     const int a[arraySize] = { 1, 2, 3, 4, 5 };
