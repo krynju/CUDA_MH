@@ -1,3 +1,3 @@
 #pragma once
 
-extern "C" int cuda_main(int argc, char** argv);
+extern "C" float * cuda_main(int N , int burn_N);
