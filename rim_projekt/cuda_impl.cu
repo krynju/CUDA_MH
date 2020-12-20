@@ -138,11 +138,9 @@ int mh(float*x,float x0, int N, int burn_N, float (*cpu_f)(float), float (*f)(fl
     float (*fff)(float);
     checkCudaErrors(cudaMemcpyFromSymbol(&fff, dev_ff_p, sizeof(f))); //tu nie mogę podać f po prostu tylko muszę ff_gpu_stat
 
-
     checkCudaErrors(cudaEventCreate(&start));
     checkCudaErrors(cudaEventCreate(&stop));
     checkCudaErrors(cudaEventRecord(start, 0));
-
    
     dev_generate<<<block_num,BLOCK_SIZE>>>(devMTGPStates, dev_x, N, xt, std, fff);
 

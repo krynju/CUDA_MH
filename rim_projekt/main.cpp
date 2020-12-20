@@ -2,7 +2,8 @@
 #include <string>
 #include <fstream>
 #include <iterator>
-#define NN 10000000 // around limit for 1060 3gb, 
+
+#define NN 10000000 // 0.5 *10^9 is a limit for 1060 3gb , float32
 #define BURN_N 100000
 
 #define save_result false
