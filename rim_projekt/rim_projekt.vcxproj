@@ -81,15 +81,21 @@
     </CudaCompile>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <CudaCompile Include="kernel.cu">
+    <CudaCompile Include="cuda_impl.cu">
       <FileType>CudaCompile</FileType>
     </CudaCompile>
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="common.cpp" />
+    <ClCompile Include="Density.cpp" />
     <ClCompile Include="main.cpp" />
+    <ClCompile Include="cpp_impl.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="common.hpp" />
     <ClInclude Include="cuda_header.h" />
+    <ClInclude Include="Density.hpp" />
+    <ClInclude Include="cpp_header.hpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
