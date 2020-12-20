@@ -2,10 +2,10 @@
 #include <string>
 #include <fstream>
 #include <iterator>
-#define NN 500000000 // around limit for 1060 3gb, 
+#define NN 10000000 // around limit for 1060 3gb, 
 #define BURN_N 100000
 
-#define save_result true
+#define save_result false
 
 
 int main(int argc, char** argv) {

@@ -21,27 +21,26 @@
 
 // CPU CODE FOR STD TUNING 
 
-double cpu_norm_pdf(double mean, float std, float x) {
-    const double a = 1 / sqrt(2 * M_PI);
+float cpu_norm_pdf(float mean, float std, float x) {
+    const float a = 1 / sqrt(2 * M_PI);
     return a / std * exp(-0.5 * pow(((x - mean) / std), 2));
 }
 
-double cpu_ff(float x) {
+float cpu_ff(float x) {
     x = x / 100.0;
-    return double(cpu_norm_pdf(0.0, 1.0, x) + cpu_norm_pdf(3.0, 1.0, x) + cpu_norm_pdf(6.0, 1.0, x));
+    return cpu_norm_pdf(0.0, 1.0, x) + cpu_norm_pdf(3.0, 1.0, x) + cpu_norm_pdf(6.0, 1.0, x);
 }
 
-std::tuple<float, float> cpu_burn_loop(float xt, float std, int burn_N, double (*f)(float), std::mt19937 gen) {
-    double f_xt = f(xt);
-    std::tuple<float, double, double> res;
-    std::uniform_real<double> uni(0, 1);
+std::tuple<float, float> cpu_burn_loop(float xt, float std, int burn_N, float (*f)(float), std::mt19937 gen) {
+    float f_xt = f(xt);
+    std::uniform_real<float> uni(0, 1);
     const float target = 0.3;
     int accepted = 0;
     for (int t = 0; t < burn_N; t++) {
         std::normal_distribution<> g(xt, std);
         float xc = g(gen);
-        double f_xc = f(xc);
-        double a = f_xc / f_xt;
+        float f_xc = f(xc);
+        float a = f_xc / f_xt;
         float u = uni(gen);
         if (u <= a) {
             xt = xc;
@@ -73,7 +72,7 @@ __device__ float dev_ff(float x) {
 __device__ float(*dev_ff_p)(float) = dev_ff;
 
 
-__global__ void _generate_loop_gpu(curandStateMtgp32* state, float* x, int x_len, float xt, float std, float (*f)(float)) {
+__global__ void dev_generate(curandStateMtgp32* state, float* x, int x_len, float xt, float std, float (*f)(float)) {
     int i = SAMPLES_PER_JOB * BLOCK_SIZE * blockIdx.x   + threadIdx.x * SAMPLES_PER_JOB;
     int sstart_range = i ;
     int eend_range= i + SAMPLES_PER_JOB;
@@ -95,7 +94,7 @@ __global__ void _generate_loop_gpu(curandStateMtgp32* state, float* x, int x_len
     }
 }
 
-cudaError_t mh(float*x,float x0, int N, int burn_N, float (*f)(float), int seed) {
+int mh(float*x,float x0, int N, int burn_N, float (*cpu_f)(float), float (*f)(float), int seed) {
     const int samples_per_block = (BLOCK_SIZE * SAMPLES_PER_JOB);
     const int block_num = (N + samples_per_block - 1) / samples_per_block;
 
@@ -105,19 +104,12 @@ cudaError_t mh(float*x,float x0, int N, int burn_N, float (*f)(float), int seed)
     float elapsedTime;
     Clock::time_point t0 = Clock::now();
 
-    cudaError_t cudaStatus = cudaSetDevice(0);
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaSetDevice failed!");
-        goto Error;
-    }   
+    checkCudaErrors(cudaSetDevice(0));
 
     float* dev_x;
 
-    cudaStatus = cudaMalloc((void**)&dev_x, N * sizeof(float));
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaMalloc failed!");
-        goto Error;
-    }
+    checkCudaErrors(cudaMalloc((void**)&dev_x, N * sizeof(float)));
+
     
     float xt = x0;
     float std = 1.0;
@@ -125,7 +117,7 @@ cudaError_t mh(float*x,float x0, int N, int burn_N, float (*f)(float), int seed)
     std::mt19937 gen(seed);
 
     std::tuple<float, float> res;
-    res = cpu_burn_loop( xt, std, burn_N, cpu_ff, gen);
+    res = cpu_burn_loop( xt, std, burn_N, cpu_f, gen);
     //printf("std = %f \n", std::get<1>(res));
 
     xt = std::get<0>(res);
@@ -134,9 +126,9 @@ cudaError_t mh(float*x,float x0, int N, int burn_N, float (*f)(float), int seed)
     curandStateMtgp32* devMTGPStates;
     mtgp32_kernel_params* devKernelParams;
 
-    cudaMalloc((void**)&devMTGPStates, block_num * sizeof(curandStateMtgp32));
+    checkCudaErrors(cudaMalloc((void**)&devMTGPStates, block_num * sizeof(curandStateMtgp32)));
 
-    cudaMalloc((void**)&devKernelParams, sizeof(mtgp32_kernel_params));
+    checkCudaErrors(cudaMalloc((void**)&devKernelParams, sizeof(mtgp32_kernel_params)));
 
     curandMakeMTGP32Constants(mtgp32dc_params_fast_11213, devKernelParams);
 
@@ -144,7 +136,7 @@ cudaError_t mh(float*x,float x0, int N, int burn_N, float (*f)(float), int seed)
     curandMakeMTGP32KernelState(devMTGPStates,mtgp32dc_params_fast_11213, devKernelParams, block_num, seed * 117);
 
     float (*fff)(float);
-    cudaMemcpyFromSymbol(&fff, dev_ff_p, sizeof(f)); //tu nie mogę podać f po prostu tylko muszę ff_gpu_stat
+    checkCudaErrors(cudaMemcpyFromSymbol(&fff, dev_ff_p, sizeof(f))); //tu nie mogę podać f po prostu tylko muszę ff_gpu_stat
 
 
     checkCudaErrors(cudaEventCreate(&start));
@@ -152,34 +144,20 @@ cudaError_t mh(float*x,float x0, int N, int burn_N, float (*f)(float), int seed)
     checkCudaErrors(cudaEventRecord(start, 0));
 
    
-    _generate_loop_gpu<<<block_num,BLOCK_SIZE>>>(devMTGPStates, dev_x,N, xt, std, fff);
+    dev_generate<<<block_num,BLOCK_SIZE>>>(devMTGPStates, dev_x, N, xt, std, fff);
 
     checkCudaErrors(cudaGetLastError());
     checkCudaErrors(cudaEventRecord(stop, 0));
     checkCudaErrors(cudaEventSynchronize(stop));
-    checkCudaErrors(cudaEventElapsedTime(&elapsedTime, start, stop)
-    );
+    checkCudaErrors(cudaEventElapsedTime(&elapsedTime, start, stop));
     checkCudaErrors(cudaEventDestroy(start));
     checkCudaErrors(cudaEventDestroy(stop));
 
-    cudaStatus = cudaGetLastError();
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "addKernel launch failed: %s\n", cudaGetErrorString(cudaStatus));
-        goto Error;
-    }
 
-
-    cudaStatus = cudaDeviceSynchronize();
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaDeviceSynchronize returned error code %d after launching addKernel!\n", cudaStatus);
-        goto Error;
-    }
-
-    cudaStatus = cudaMemcpy(x, dev_x, N * sizeof(float), cudaMemcpyDeviceToHost);
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaMemcpy failed!");
-        goto Error;
-    }
+    checkCudaErrors(cudaGetLastError());
+    checkCudaErrors(cudaDeviceSynchronize());
+    checkCudaErrors(cudaMemcpy(x, dev_x, N * sizeof(float), cudaMemcpyDeviceToHost));
+  
 
     Clock::time_point t1 = Clock::now();
 
@@ -187,27 +165,19 @@ cudaError_t mh(float*x,float x0, int N, int burn_N, float (*f)(float), int seed)
 
     printf("Kernel-only time: %f ms\n", elapsedTime);
     printf("All time %d ms \n", d.count());
+ 
+    checkCudaErrors(cudaFree(dev_x));
 
-Error:
-    cudaFree(dev_x);
-
-    return cudaStatus;
+    return 0;
 }
 
 extern "C" float* cuda_main(int N, int burn_N)
 {
     float* x = (float*)malloc(sizeof(float) * N);
 
+    mh(x, 0.0, N, burn_N, cpu_ff,dev_ff_p, 1117);
 
-    cudaError_t cudaStatus = mh(x, 0.0, N, burn_N, dev_ff_p, 42141241);
-
-   
-
-
-    cudaStatus = cudaDeviceReset();
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaDeviceReset failed!");
-    }
+    checkCudaErrors(cudaDeviceReset());
 
     return x;
 }
