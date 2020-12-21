@@ -1,4 +1,5 @@
 #include "cuda_header.h"
+
 #include <string>
 #include <fstream>
 #include <iterator>
@@ -7,6 +8,12 @@
 #define BURN_N 100000
 
 #define save_result false
+
+#define use_matlab false
+
+#if use_matlab
+    #include "MatlabEngineWrapper.h"
+#endif
 
 
 int main(int argc, char** argv) {
@@ -28,6 +35,14 @@ int main(int argc, char** argv) {
 
 	float *x = cuda_main(N, burn_N);
 
+#if use_matlab
+
+    float test_float_array[] = { 1, 2, 3, 4, 5 };
+    MatlabEngineWrapper::instance().setArray("test", test_float_array, 5);
+
+    MatlabEngineWrapper::instance().setArray("result", x, N);
+
+#endif
 
     if (save || save_result ) {
         std::ofstream output_file("result.csv");
