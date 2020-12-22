@@ -1,4 +1,4 @@
-﻿#define _USE_MATH_DEFINES
+#define _USE_MATH_DEFINES
 #include "cuda_runtime.h"
 #include "device_launch_parameters.h"
 #include "helper_cuda.h"
@@ -18,7 +18,7 @@
 #define SAMPLES_PER_JOB 10000
 #define BLOCK_SIZE 256
 #define BLOCKS_PER_STREAM 1
-
+#define MAX_STREAMS_COUNT 8
 
 // CPU CODE FOR STD TUNING 
 
@@ -170,33 +170,27 @@ int mh(float*x,float x0, int N, int burn_N, float (*cpu_f)(float), float (*f)(fl
     // checkCudaErrors(cudaEventCreate(&start));
     // checkCudaErrors(cudaEventCreate(&stop));
     // checkCudaErrors(cudaEventRecord(start, 0));
-    int samples_pool[streams];
+    int samples_pool[MAX_STREAMS_COUNT];
     int temp_N = N;
     const int samples_per_stream = BLOCKS_PER_STREAM * BLOCK_SIZE * SAMPLES_PER_JOB;
-    for (int i = 0; i<streams, i++){
+    for (int i = 0; i < n_streams; i++) {
         if (temp_N >= samples_per_stream){
             samples_pool[i] = samples_per_stream;
             temp_N -= samples_per_stream;
         }else{
             samples_pool[i] = temp_N;
-            assert(i == streams - 1);
         }
     }
-    cudaStream_t stream[n_streams];
-    for (int s = 0; s<streams, s++){
+    cudaStream_t stream[MAX_STREAMS_COUNT];
+    for (int s = 0; s < n_streams; s++) {
         checkCudaErrors(cudaStreamCreate(&stream[s]));
-        dev_generate<<<block_num,BLOCK_SIZE, 0, stream[x]>>>(
-            devMTGPStates + s * BLOCKS_PER_STREAM, 
-            dev_x + s * samples_per_stream,
-            samples_pool[s],
-            xt, std, fff);
+        dev_generate<<<block_num, BLOCK_SIZE, 0, stream[s]>>>(devMTGPStates + s * BLOCKS_PER_STREAM, dev_x + s * samples_per_stream, samples_pool[s], xt, std, fff);
 
         checkCudaErrors(cudaMemcpyAsync(x+ s * samples_per_stream, dev_x + s * samples_per_stream, samples_pool[s] * sizeof(float), cudaMemcpyDeviceToHost));
 
-        checkCudaErrors(cudaStreamDestroy(stream[s]))
+        checkCudaErrors(cudaStreamDestroy(stream[s]));
     }
-   
-   
+
 
     // for kernel time measurement
     // checkCudaErrors(cudaGetLastError());
