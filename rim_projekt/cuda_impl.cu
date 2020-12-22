@@ -16,7 +16,8 @@
 #include <curand_kernel.h>
 
 #define SAMPLES_PER_JOB 10000
-#define BLOCK_SIZE 250
+#define BLOCK_SIZE 256
+#define BLOCKS_PER_STREAM 1
 
 
 // CPU CODE FOR STD TUNING 
@@ -73,14 +74,40 @@ __device__ float(*dev_ff_p)(float) = dev_ff;
 
 
 __global__ void dev_generate(curandStateMtgp32* state, float* x, int x_len, float xt, float std, float (*f)(float)) {
-    int i = SAMPLES_PER_JOB * BLOCK_SIZE * blockIdx.x   + threadIdx.x * SAMPLES_PER_JOB;
-    int sstart_range = i ;
-    int eend_range= i + SAMPLES_PER_JOB;
+    // int i = SAMPLES_PER_JOB * BLOCK_SIZE * blockIdx.x   + threadIdx.x * SAMPLES_PER_JOB;
+    // int sstart_range = i ;
+    // int eend_range= i + SAMPLES_PER_JOB;
 
-    if (eend_range > x_len) { eend_range = x_len; }
+    // !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+    // chodzi w tej zmianie o to, że zamiast każdy wątek pisać w swoim rejonie (oddalone o 10k próbek), to wszystkie
+    // piszą do zbliżonych adresów, w ramach warpu to jest tak że zakres 16 floatów wypełniany jest pojedynczo przez każdy wątek w pojedynczej iteracji
+    // to powinno przyspieszyć grupowanie tych zapisów do globalnej a kolejność próbek nie ma w ogóle znaczenia.
+
+    int warp_id = threadIdx.x / 16;
+    int id_in_warp = threadIdx.x % 16;
+    int warp_range_start = SAMPLES_PER_JOB * BLOCK_SIZE * blockIdx.x + warp_id * 16 * SAMPLES_PER_JOB;
+    int warp_range_end = SAMPLES_PER_JOB * BLOCK_SIZE * blockIdx.x + (warp_id+1) * 16 * SAMPLES_PER_JOB;
+
+    if (warp_range_end > x_len) 
+        warp_range_end = x_len;
+
+    // if (eend_range > x_len) { eend_range = x_len; }
   
     float f_xt = f(xt);
-    for (int t = sstart_range; t < eend_range; t++) {
+    // for (int t = sstart_range; t < eend_range  ; t++) {
+    //     float xc = xt + curand_normal(&state[blockIdx.x])*std ;
+    //     float f_xc = f(xc);
+    //     float a = f_xc / f_xt;
+    //     float u = curand_uniform(&state[blockIdx.x]);
+  
+    //     if (u <= a) {
+    //         xt = xc;
+    //         f_xt = f_xc;
+    //     }
+    //     x[t] = xt;
+    // }
+
+    for (int t = warp_range_start; t < warp_range_end  ; t+=16) {
         float xc = xt + curand_normal(&state[blockIdx.x])*std ;
         float f_xc = f(xc);
         float a = f_xc / f_xt;
@@ -90,13 +117,14 @@ __global__ void dev_generate(curandStateMtgp32* state, float* x, int x_len, floa
             xt = xc;
             f_xt = f_xc;
         }
-        x[t] = xt;
+        x[t + id_in_warp] = xt;
     }
 }
 
 int mh(float*x,float x0, int N, int burn_N, float (*cpu_f)(float), float (*f)(float), int seed) {
     const int samples_per_block = (BLOCK_SIZE * SAMPLES_PER_JOB);
     const int block_num = (N + samples_per_block - 1) / samples_per_block;
+    const int n_streams = 1 + (block_num-1) / BLOCKS_PER_STREAM;
 
     typedef std::chrono::high_resolution_clock Clock;
     
@@ -138,30 +166,58 @@ int mh(float*x,float x0, int N, int burn_N, float (*cpu_f)(float), float (*f)(fl
     float (*fff)(float);
     checkCudaErrors(cudaMemcpyFromSymbol(&fff, dev_ff_p, sizeof(f))); //tu nie mogę podać f po prostu tylko muszę ff_gpu_stat
 
-    checkCudaErrors(cudaEventCreate(&start));
-    checkCudaErrors(cudaEventCreate(&stop));
-    checkCudaErrors(cudaEventRecord(start, 0));
-   
-    dev_generate<<<block_num,BLOCK_SIZE>>>(devMTGPStates, dev_x, N, xt, std, fff);
+    // for kernel time measurement
+    // checkCudaErrors(cudaEventCreate(&start));
+    // checkCudaErrors(cudaEventCreate(&stop));
+    // checkCudaErrors(cudaEventRecord(start, 0));
+    int samples_pool[streams];
+    int temp_N = N;
+    const int samples_per_stream = BLOCKS_PER_STREAM * BLOCK_SIZE * SAMPLES_PER_JOB;
+    for (int i = 0; i<streams, i++){
+        if (temp_N >= samples_per_stream){
+            samples_pool[i] = samples_per_stream;
+            temp_N -= samples_per_stream;
+        }else{
+            samples_pool[i] = temp_N;
+            assert(i == streams - 1);
+        }
+    }
+    cudaStream_t stream[n_streams];
+    for (int s = 0; s<streams, s++){
+        checkCudaErrors(cudaStreamCreate(&stream[s]));
+        dev_generate<<<block_num,BLOCK_SIZE, 0, stream[x]>>>(
+            devMTGPStates + s * BLOCKS_PER_STREAM, 
+            dev_x + s * samples_per_stream,
+            samples_pool[s],
+            xt, std, fff);
 
-    checkCudaErrors(cudaGetLastError());
-    checkCudaErrors(cudaEventRecord(stop, 0));
-    checkCudaErrors(cudaEventSynchronize(stop));
-    checkCudaErrors(cudaEventElapsedTime(&elapsedTime, start, stop));
-    checkCudaErrors(cudaEventDestroy(start));
-    checkCudaErrors(cudaEventDestroy(stop));
+        checkCudaErrors(cudaMemcpyAsync(x+ s * samples_per_stream, dev_x + s * samples_per_stream, samples_pool[s] * sizeof(float), cudaMemcpyDeviceToHost));
+
+        checkCudaErrors(cudaStreamDestroy(stream[s]))
+    }
+   
+   
+
+    // for kernel time measurement
+    // checkCudaErrors(cudaGetLastError());
+    // checkCudaErrors(cudaEventRecord(stop, 0));
+    // checkCudaErrors(cudaEventSynchronize(stop));
+    // checkCudaErrors(cudaEventElapsedTime(&elapsedTime, start, stop));
+    // checkCudaErrors(cudaEventDestroy(start));
+    // checkCudaErrors(cudaEventDestroy(stop));
 
 
     checkCudaErrors(cudaGetLastError());
     checkCudaErrors(cudaDeviceSynchronize());
-    checkCudaErrors(cudaMemcpy(x, dev_x, N * sizeof(float), cudaMemcpyDeviceToHost));
+    
   
 
     Clock::time_point t1 = Clock::now();
 
     auto d = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0);
 
-    printf("Kernel-only time: %f ms\n", elapsedTime);
+    // for kernel time measurement
+    // printf("Kernel-only time: %f ms\n", elapsedTime);
     printf("All time %d ms \n", d.count());
  
     checkCudaErrors(cudaFree(dev_x));
