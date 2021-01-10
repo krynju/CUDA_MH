@@ -18,7 +18,7 @@
 #define SAMPLES_PER_THREAD 10000
 #define BLOCK_SIZE 256
 #define BLOCKS_PER_STREAM 1
-#define MAX_STREAMS_COUNT 8
+#define MAX_STREAMS_COUNT 64
 
 // CPU CODE FOR STD TUNING 
 
@@ -119,10 +119,10 @@ __global__ void dev_generate(curandStateMtgp32* state, float* x, int x_len, floa
     // }
 }
 
-int mh(float*x,float x0, int N, int burn_N, float (*cpu_f)(float), float (*f)(float), int seed) {
+int mh(float* x, float x0, int N, int burn_N, float (*cpu_f)(float), float (*f)(float), int seed) {
     const int samples_per_block = (BLOCK_SIZE * SAMPLES_PER_THREAD);
     const int block_num = (N + samples_per_block - 1) / samples_per_block;
-    const int n_streams = 1 + (block_num-1) / BLOCKS_PER_STREAM;
+    const int n_streams = 1 + (block_num - 1) / BLOCKS_PER_STREAM;
 
     typedef std::chrono::high_resolution_clock Clock;
     cudaEvent_t start, stop;
@@ -133,14 +133,16 @@ int mh(float*x,float x0, int N, int burn_N, float (*cpu_f)(float), float (*f)(fl
 
     // Do researchu, czy można to robic w ramach streamu i jak to kontrolować żeby nie zaalokować za dużo na device 
     float* dev_x;
-    checkCudaErrors(cudaMalloc((void**)&dev_x, N * sizeof(float)));
+
+    cudaHostRegister(x, N * sizeof(float), 0);
+
 
     // Strojenie odchylenia standardowego wspólne na CPU
     float xt = x0;
     float std = 1.0;
     std::mt19937 gen(seed);
     std::tuple<float, float> res;
-    res = cpu_burn_loop( xt, std, burn_N, cpu_f, gen);
+    res = cpu_burn_loop(xt, std, burn_N, cpu_f, gen);
     //printf("std = %f \n", std::get<1>(res));
 
     xt = std::get<0>(res);
@@ -160,7 +162,10 @@ int mh(float*x,float x0, int N, int burn_N, float (*cpu_f)(float), float (*f)(fl
     curandMakeMTGP32Constants(mtgp32dc_params_fast_11213, devKernelParams);
 
     /* Initialize one state per thread block */
-    curandMakeMTGP32KernelState(devMTGPStates,mtgp32dc_params_fast_11213, devKernelParams, block_num, seed * 117);
+    //curandMakeMTGP32KernelState(devMTGPStates,mtgp32dc_params_fast_11213, devKernelParams, block_num, seed * 117);
+    for (int i = 0; i < block_num; i++) {
+        curandMakeMTGP32KernelState(devMTGPStates, mtgp32dc_params_fast_11213, devKernelParams, block_num, seed * 117 * i);
+    }
 
     float (*fff)(float);
     checkCudaErrors(cudaMemcpyFromSymbol(&fff, dev_ff_p, sizeof(f)));
@@ -175,14 +180,18 @@ int mh(float*x,float x0, int N, int burn_N, float (*cpu_f)(float), float (*f)(fl
     int temp_N = N;
     const int samples_per_stream = BLOCKS_PER_STREAM * BLOCK_SIZE * SAMPLES_PER_THREAD;
     for (int i = 0; i < n_streams; i++) {
-        if (temp_N >= samples_per_stream){
+        if (temp_N >= samples_per_stream) {
             samples_pool[i] = samples_per_stream;
             temp_N -= samples_per_stream;
-        }else{
+        }
+        else {
             samples_pool[i] = temp_N;
         }
     }// budowa wektora ilości próbek generowanej przez każdy stream
     // TODO: można zrobić to lepiej równomiernie dystrybuując próbki 
+
+    int sample_memory_pools = N / samples_per_stream;
+    checkCudaErrors(cudaMalloc((void**)&dev_x, N * sizeof(float)));
 
     // !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
     // Konfiguracja tej pętli jest następująco przygotowana do testów.
@@ -198,15 +207,22 @@ int mh(float*x,float x0, int N, int burn_N, float (*cpu_f)(float), float (*f)(fl
     //                   pamięć na te obiekty streamów. Potem natomiast tworzymy ich tylko tyle ile zostało ich 
     //                   policzonych w poprzednim kroku.
     // !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!                   
-
+    int MEMORY_POOLS = 10;
+    cudaEvent_t streamMemoryPoolFreeEvent[2* MAX_STREAMS_COUNT];
+    for (int i = 0; i < 2 * MAX_STREAMS_COUNT; i++) {
+        cudaEventCreateWithFlags(&streamMemoryPoolFreeEvent[i], cudaEventDisableTiming & cudaEventBlockingSync);
+    }
+    
     cudaStream_t stream[MAX_STREAMS_COUNT];
     for (int s = 0; s < n_streams; s++) {
-        checkCudaErrors(cudaStreamCreate(&stream[s]));
-        dev_generate<<<block_num, BLOCK_SIZE, 0, stream[s]>>>(devMTGPStates + s * BLOCKS_PER_STREAM, dev_x + s * samples_per_stream, samples_pool[s], xt, std, fff);
+        if (s >= MEMORY_POOLS) checkCudaErrors(cudaEventSynchronize(streamMemoryPoolFreeEvent[s]));
+        checkCudaErrors(cudaStreamCreateWithFlags(&stream[s], cudaStreamNonBlocking));
 
-        checkCudaErrors(cudaMemcpyAsync(x+ s * samples_per_stream, dev_x + s * samples_per_stream, samples_pool[s] * sizeof(float), cudaMemcpyDeviceToHost));
+           
+        dev_generate<<<block_num, BLOCK_SIZE, 0, stream[s]>>>(devMTGPStates + s * BLOCKS_PER_STREAM, dev_x + s % MEMORY_POOLS * samples_per_stream, samples_pool[s], xt, std, fff);
 
-        checkCudaErrors(cudaStreamDestroy(stream[s]));
+        checkCudaErrors(cudaMemcpyAsync(x + s * samples_per_stream, dev_x + s % MEMORY_POOLS * samples_per_stream, samples_pool[s] * sizeof(float), cudaMemcpyDeviceToHost, stream[s]));
+        checkCudaErrors(cudaEventRecord(streamMemoryPoolFreeEvent[(s+MEMORY_POOLS) % (MAX_STREAMS_COUNT) ], stream[s]));
     }
 
 
@@ -221,8 +237,9 @@ int mh(float*x,float x0, int N, int burn_N, float (*cpu_f)(float), float (*f)(fl
 
     checkCudaErrors(cudaGetLastError());
     checkCudaErrors(cudaDeviceSynchronize());
-    
-  
+    for (int s = 0; s < n_streams; s++) {
+        checkCudaErrors(cudaStreamDestroy(stream[s]));
+    }
     Clock::time_point t1 = Clock::now();
 
     auto d = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0);
@@ -232,6 +249,7 @@ int mh(float*x,float x0, int N, int burn_N, float (*cpu_f)(float), float (*f)(fl
     printf("All time %d ms \n", d.count());
  
     checkCudaErrors(cudaFree(dev_x));
+    cudaHostUnregister(x);
 
     return 0;
 }
@@ -240,7 +258,7 @@ extern "C" float* cuda_main(int N, int burn_N)
 {
     float* x = (float*)malloc(sizeof(float) * N);
 
-    mh(x, 0.0, N, burn_N, cpu_ff,dev_ff_p, 1117);
+    mh(x, 0.0, N, burn_N, cpu_ff,dev_ff_p, 7);
 
     checkCudaErrors(cudaDeviceReset());
 
