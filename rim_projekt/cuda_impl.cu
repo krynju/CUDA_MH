@@ -33,6 +33,8 @@ float cpu_ff(float x) {
 }
 
 std::tuple<float, float> cpu_burn_loop(float xt, float std, int burn_N, float (*f)(float), std::mt19937 gen) {
+    std::normal_distribution<> temp_g(xt, std);
+    xt = temp_g(gen);
     float f_xt = f(xt);
     std::uniform_real<float> uni(0, 1);
     const float target = 0.3;
@@ -164,18 +166,17 @@ int mh(float* x, float x0, int N, int burn_N, float (*cpu_f)(float), float (*f)(
     /* Initialize one state per thread block */
     //curandMakeMTGP32KernelState(devMTGPStates,mtgp32dc_params_fast_11213, devKernelParams, block_num, seed * 117);
     for (int i = 0; i < block_num; i++) {
-        curandMakeMTGP32KernelState(devMTGPStates, mtgp32dc_params_fast_11213, devKernelParams, block_num, seed * 117 * i);
+        curandMakeMTGP32KernelState(devMTGPStates + i, mtgp32dc_params_fast_11213, devKernelParams, 1, seed * 117 * i);
     }
+    
+    
 
     float (*fff)(float);
     checkCudaErrors(cudaMemcpyFromSymbol(&fff, dev_ff_p, sizeof(f)));
     // TODO: tutaj jest problem, że nie można podać do cudaMemcpyFromSymbol na drugi arg
     // funkcji f, która została podana do aktualnej funkcji - coś z tym zrobić trzeba
 
-    // for kernel time measurement in case of 1 stream
-    // checkCudaErrors(cudaEventCreate(&start));
-    // checkCudaErrors(cudaEventCreate(&stop));
-    // checkCudaErrors(cudaEventRecord(start, 0));
+
     int samples_pool[MAX_STREAMS_COUNT];
     int temp_N = N;
     const int samples_per_stream = BLOCKS_PER_STREAM * BLOCK_SIZE * SAMPLES_PER_THREAD;
@@ -190,7 +191,7 @@ int mh(float* x, float x0, int N, int burn_N, float (*cpu_f)(float), float (*f)(
     }// budowa wektora ilości próbek generowanej przez każdy stream
     // TODO: można zrobić to lepiej równomiernie dystrybuując próbki 
 
-    int sample_memory_pools = N / samples_per_stream;
+
     checkCudaErrors(cudaMalloc((void**)&dev_x, N * sizeof(float)));
 
     // !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
@@ -207,22 +208,26 @@ int mh(float* x, float x0, int N, int burn_N, float (*cpu_f)(float), float (*f)(
     //                   pamięć na te obiekty streamów. Potem natomiast tworzymy ich tylko tyle ile zostało ich 
     //                   policzonych w poprzednim kroku.
     // !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!                   
-    int MEMORY_POOLS = 10;
-    cudaEvent_t streamMemoryPoolFreeEvent[2* MAX_STREAMS_COUNT];
-    for (int i = 0; i < 2 * MAX_STREAMS_COUNT; i++) {
-        cudaEventCreateWithFlags(&streamMemoryPoolFreeEvent[i], cudaEventDisableTiming & cudaEventBlockingSync);
+    int MEMORY_POOLS = 3;
+    cudaStream_t *stream;
+    cudaEvent_t *streamMemoryPoolFreeEvent;
+
+    checkCudaErrors(cudaHostAlloc((void**)&stream, n_streams * sizeof(cudaStream_t), 0));
+    checkCudaErrors(cudaHostAlloc((void**)&streamMemoryPoolFreeEvent , n_streams * sizeof(cudaEvent_t), 0));
+    
+    for (int i = 0; i < n_streams; i++) {
+        checkCudaErrors(cudaStreamCreateWithFlags(stream + i, cudaStreamNonBlocking));
+        cudaEventCreateWithFlags(streamMemoryPoolFreeEvent + i, cudaEventDisableTiming & cudaEventBlockingSync);
     }
     
-    cudaStream_t stream[MAX_STREAMS_COUNT];
+   
     for (int s = 0; s < n_streams; s++) {
         if (s >= MEMORY_POOLS) checkCudaErrors(cudaEventSynchronize(streamMemoryPoolFreeEvent[s]));
-        checkCudaErrors(cudaStreamCreateWithFlags(&stream[s], cudaStreamNonBlocking));
+        //if (s >= MEMORY_POOLS) checkCudaErrors(cudaStreamWaitEvent(stream[s], streamMemoryPoolFreeEvent[s]));
 
-           
-        dev_generate<<<block_num, BLOCK_SIZE, 0, stream[s]>>>(devMTGPStates + s * BLOCKS_PER_STREAM, dev_x + s % MEMORY_POOLS * samples_per_stream, samples_pool[s], xt, std, fff);
-
+        dev_generate<<<BLOCKS_PER_STREAM, BLOCK_SIZE, 0, stream[s]>>>(devMTGPStates + s * BLOCKS_PER_STREAM, dev_x + s % MEMORY_POOLS * samples_per_stream, samples_pool[s], xt, std, fff);
         checkCudaErrors(cudaMemcpyAsync(x + s * samples_per_stream, dev_x + s % MEMORY_POOLS * samples_per_stream, samples_pool[s] * sizeof(float), cudaMemcpyDeviceToHost, stream[s]));
-        checkCudaErrors(cudaEventRecord(streamMemoryPoolFreeEvent[(s+MEMORY_POOLS) % (MAX_STREAMS_COUNT) ], stream[s]));
+        if(s+MEMORY_POOLS < n_streams) checkCudaErrors(cudaEventRecord(streamMemoryPoolFreeEvent[(s+MEMORY_POOLS) ], stream[s]));
     }
 
 
