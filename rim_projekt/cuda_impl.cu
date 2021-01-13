@@ -33,8 +33,6 @@ float cpu_ff(float x) {
 }
 
 std::tuple<float, float> cpu_burn_loop(float xt, float std, int burn_N, float (*f)(float), std::mt19937 gen) {
-    std::normal_distribution<> temp_g(xt, std);
-    xt = temp_g(gen);
     float f_xt = f(xt);
     std::uniform_real<float> uni(0, 1);
     const float target = 0.3;
