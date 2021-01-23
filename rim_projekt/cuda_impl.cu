@@ -15,7 +15,7 @@
 #include <curand_mtgp32dc_p_11213.h>
 #include <curand_kernel.h>
 
-#define SAMPLES_PER_THREAD 10000
+#define SAMPLES_PER_THREAD 100000
 #define BLOCK_SIZE 256
 #define BLOCKS_PER_STREAM 1
 #define MAX_STREAMS_COUNT 64
@@ -37,6 +37,9 @@ std::tuple<float, float> cpu_burn_loop(float xt, float std, int burn_N, float (*
     std::uniform_real<float> uni(0, 1);
     const float target = 0.3;
     int accepted = 0;
+
+
+
     for (int t = 0; t < burn_N; t++) {
         std::normal_distribution<> g(xt, std);
         float xc = g(gen);
@@ -74,17 +77,17 @@ __device__ float(*dev_ff_p)(float) = dev_ff;
 
 
 __global__ void dev_generate(curandStateMtgp32* state, float* x, int x_len, float xt, float std, float (*f)(float)) {
-    int warp_id = threadIdx.x / 16;
-    int id_in_warp = threadIdx.x % 16;
-    int warp_range_start = SAMPLES_PER_THREAD * BLOCK_SIZE * blockIdx.x + warp_id * 16 * SAMPLES_PER_THREAD;
-    int warp_range_end = SAMPLES_PER_THREAD * BLOCK_SIZE * blockIdx.x + (warp_id+1) * 16 * SAMPLES_PER_THREAD;
+    int warp_id = threadIdx.x / 32;
+    int id_in_warp = threadIdx.x % 32;
+    int warp_range_start = SAMPLES_PER_THREAD * BLOCK_SIZE * blockIdx.x + warp_id * 32 * SAMPLES_PER_THREAD;
+    int warp_range_end = SAMPLES_PER_THREAD * BLOCK_SIZE * blockIdx.x + (warp_id + 1) * 32 * SAMPLES_PER_THREAD;
 
-    if (warp_range_end > x_len) 
+    if (warp_range_end > x_len)
         warp_range_end = x_len;
-  
+
     float f_xt = f(xt);
 
-    for (int t = warp_range_start; t < warp_range_end  ; t+=16) {
+    for (int t = warp_range_start; t < warp_range_end  ; t+=32) {
         float xc = xt + curand_normal(&state[blockIdx.x])*std ;
         float f_xc = f(xc);
         float a = f_xc / f_xt;
@@ -95,7 +98,7 @@ __global__ void dev_generate(curandStateMtgp32* state, float* x, int x_len, floa
             f_xt = f_xc;
         }
         x[t + id_in_warp] = xt;
-        // W tej pętli każdy wątek w ramach warpu pisze do co 16 adresu w pamięci, żeby lepiej grupować 
+        // W tej pętli każdy wątek w ramach warpu pisze do co 32 adresu w pamięci, żeby lepiej grupować 
         // transfery pamięci
         // TODO: Do porównania z poniższą zakomentowaną wersją, gdzie każdy wątek pisze do swojego przedziału
     }
@@ -134,6 +137,10 @@ int mh(float* x, float x0, int N, int burn_N, float (*cpu_f)(float), float (*f)(
     // Do researchu, czy można to robic w ramach streamu i jak to kontrolować żeby nie zaalokować za dużo na device 
     float* dev_x;
 
+    size_t free = 0, total= 0;
+
+    cudaMemGetInfo(&free, &total);
+
     cudaHostRegister(x, N * sizeof(float), 0);
 
 
@@ -149,25 +156,7 @@ int mh(float* x, float x0, int N, int burn_N, float (*cpu_f)(float), float (*f)(
     std = std::get<1>(res);
 
 
-    // Używamy generatora MTGP32, mamy do porównania wersje zaimplementowane na CPU sekwencyjnie i równolegle i
-    // one wykorzystują również ten sam generator
-    curandStateMtgp32* devMTGPStates;
-    mtgp32_kernel_params* devKernelParams;
 
-    // Każdy blok dostaje swój generator, każdy generator może wydajnie obsłużyć max 256 wątków w ramach bloku
-    checkCudaErrors(cudaMalloc((void**)&devMTGPStates, block_num * sizeof(curandStateMtgp32)));
-
-    checkCudaErrors(cudaMalloc((void**)&devKernelParams, sizeof(mtgp32_kernel_params)));
-
-    curandMakeMTGP32Constants(mtgp32dc_params_fast_11213, devKernelParams);
-
-    /* Initialize one state per thread block */
-    //curandMakeMTGP32KernelState(devMTGPStates,mtgp32dc_params_fast_11213, devKernelParams, block_num, seed * 117);
-    for (int i = 0; i < block_num; i++) {
-        curandMakeMTGP32KernelState(devMTGPStates + i, mtgp32dc_params_fast_11213, devKernelParams, 1, seed * 117 * i);
-    }
-    
-    
 
     float (*fff)(float);
     checkCudaErrors(cudaMemcpyFromSymbol(&fff, dev_ff_p, sizeof(f)));
@@ -190,7 +179,6 @@ int mh(float* x, float x0, int N, int burn_N, float (*cpu_f)(float), float (*f)(
     // TODO: można zrobić to lepiej równomiernie dystrybuując próbki 
 
 
-    checkCudaErrors(cudaMalloc((void**)&dev_x, N * sizeof(float)));
 
     // !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
     // Konfiguracja tej pętli jest następująco przygotowana do testów.
@@ -205,8 +193,15 @@ int mh(float* x, float x0, int N, int burn_N, float (*cpu_f)(float), float (*f)(
     // MAX_STREAMS_COUNT mówi jedynie o maksymalnej możliwej liczbie streamów, ponieważ statycznie alokujemy poniżej 
     //                   pamięć na te obiekty streamów. Potem natomiast tworzymy ich tylko tyle ile zostało ich 
     //                   policzonych w poprzednim kroku.
-    // !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!                   
-    int MEMORY_POOLS = 3;
+    // !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!  
+
+    int MEMORY_POOLS_AVAILABLE = free / sizeof(float) / samples_per_stream;
+    int MEMORY_POOLS = MEMORY_POOLS_AVAILABLE * 8 / 10;
+
+   
+    checkCudaErrors(cudaMalloc((void**)&dev_x, MEMORY_POOLS * samples_per_stream * sizeof(float)));
+
+
     cudaStream_t *stream;
     cudaEvent_t *streamMemoryPoolFreeEvent;
 
@@ -217,15 +212,36 @@ int mh(float* x, float x0, int N, int burn_N, float (*cpu_f)(float), float (*f)(
         checkCudaErrors(cudaStreamCreateWithFlags(stream + i, cudaStreamNonBlocking));
         cudaEventCreateWithFlags(streamMemoryPoolFreeEvent + i, cudaEventDisableTiming & cudaEventBlockingSync);
     }
+
+    // Używamy generatora MTGP32, mamy do porównania wersje zaimplementowane na CPU sekwencyjnie i równolegle i
+    // one wykorzystują również ten sam generator
+    curandStateMtgp32* devMTGPStates;
+    mtgp32_kernel_params* devKernelParams;
+
+    // Każdy blok dostaje swój generator, każdy generator może wydajnie obsłużyć max 256 wątków w ramach bloku
+    checkCudaErrors(cudaMalloc((void**)&devMTGPStates, block_num * sizeof(curandStateMtgp32)));
+
+    checkCudaErrors(cudaMalloc((void**)&devKernelParams, sizeof(mtgp32_kernel_params)));
+
+    curandMakeMTGP32Constants(mtgp32dc_params_fast_11213, devKernelParams);
+
+    /* Initialize one state per thread block */
+    //curandMakeMTGP32KernelState(devMTGPStates,mtgp32dc_params_fast_11213, devKernelParams, block_num, seed * 117);
+    for (int i = 0; i < block_num; i++) {
+        curandMakeMTGP32KernelState(devMTGPStates + i, mtgp32dc_params_fast_11213, devKernelParams, 1, seed * 7 * i);
+    }
+    //curandMakeMTGP32KernelState(devMTGPStates, mtgp32dc_params_fast_11213, devKernelParams, block_num, seed * 117);
+
     
+
    
     for (int s = 0; s < n_streams; s++) {
-        if (s >= MEMORY_POOLS) checkCudaErrors(cudaEventSynchronize(streamMemoryPoolFreeEvent[s]));
-        //if (s >= MEMORY_POOLS) checkCudaErrors(cudaStreamWaitEvent(stream[s], streamMemoryPoolFreeEvent[s]));
+        //if (s >= MEMORY_POOLS) checkCudaErrors(cudaEventSynchronize(streamMemoryPoolFreeEvent[s]));
+        if (s >= MEMORY_POOLS) checkCudaErrors(cudaStreamWaitEvent(stream[s], streamMemoryPoolFreeEvent[s]));
 
         dev_generate<<<BLOCKS_PER_STREAM, BLOCK_SIZE, 0, stream[s]>>>(devMTGPStates + s * BLOCKS_PER_STREAM, dev_x + s % MEMORY_POOLS * samples_per_stream, samples_pool[s], xt, std, fff);
         checkCudaErrors(cudaMemcpyAsync(x + s * samples_per_stream, dev_x + s % MEMORY_POOLS * samples_per_stream, samples_pool[s] * sizeof(float), cudaMemcpyDeviceToHost, stream[s]));
-        if(s+MEMORY_POOLS < n_streams) checkCudaErrors(cudaEventRecord(streamMemoryPoolFreeEvent[(s+MEMORY_POOLS) ], stream[s]));
+        if(s+MEMORY_POOLS < n_streams) checkCudaErrors(cudaEventRecord(streamMemoryPoolFreeEvent[(s+MEMORY_POOLS)], stream[s]));
     }
 
 
