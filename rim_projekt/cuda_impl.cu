@@ -15,7 +15,12 @@
 #include <curand_mtgp32dc_p_11213.h>
 #include <curand_kernel.h>
 
-#define SAMPLES_PER_THREAD 100000
+//#define SAMPLES_PER_THREAD 100000
+// Samples per thread should be at most
+// 10^3 for 10^6 samples
+// 10^4 for 10^7 samples
+// 10^5 for 10^8 samples
+ 
 #define BLOCK_SIZE 256
 #define BLOCKS_PER_STREAM 1
 #define MAX_STREAMS_COUNT 64
@@ -76,16 +81,29 @@ __device__ float dev_ff(float x) {
 __device__ float(*dev_ff_p)(float) = dev_ff;
 
 
-__global__ void dev_generate(curandStateMtgp32* state, float* x, int x_len, float xt, float std, float (*f)(float)) {
+__global__ void dev_generate(curandStateMtgp32* state, float* x, int x_len, float xt, float std,int samples_per_thread, float (*f)(float)) {
     int warp_id = threadIdx.x / 32;
     int id_in_warp = threadIdx.x % 32;
-    int warp_range_start = SAMPLES_PER_THREAD * BLOCK_SIZE * blockIdx.x + warp_id * 32 * SAMPLES_PER_THREAD;
-    int warp_range_end = SAMPLES_PER_THREAD * BLOCK_SIZE * blockIdx.x + (warp_id + 1) * 32 * SAMPLES_PER_THREAD;
+    int warp_range_start = samples_per_thread * BLOCK_SIZE * blockIdx.x + warp_id * 32 * samples_per_thread;
+    int warp_range_end = samples_per_thread * BLOCK_SIZE * blockIdx.x + (warp_id + 1) * 32 * samples_per_thread;
 
     if (warp_range_end > x_len)
         warp_range_end = x_len;
 
     float f_xt = f(xt);
+
+    // new starting point for each thread
+    for (int t = 0; t < 1000; t++) {
+        float xc = xt + curand_normal(&state[blockIdx.x]) * std / 4.0f ;
+        float f_xc = f(xc);
+        float a = f_xc / f_xt;
+        float u = curand_uniform(&state[blockIdx.x]);
+
+        if (u <= a) {
+            xt = xc;
+            f_xt = f_xc;
+        }
+    }
 
     for (int t = warp_range_start; t < warp_range_end  ; t+=32) {
         float xc = xt + curand_normal(&state[blockIdx.x])*std ;
@@ -102,6 +120,7 @@ __global__ void dev_generate(curandStateMtgp32* state, float* x, int x_len, floa
         // transfery pamięci
         // TODO: Do porównania z poniższą zakomentowaną wersją, gdzie każdy wątek pisze do swojego przedziału
     }
+
 
     // int i = SAMPLES_PER_THREAD * BLOCK_SIZE * blockIdx.x   + threadIdx.x * SAMPLES_PER_THREAD;
     // int sstart_range = i ;
@@ -123,9 +142,23 @@ __global__ void dev_generate(curandStateMtgp32* state, float* x, int x_len, floa
 }
 
 int mh(float* x, float x0, int N, int burn_N, float (*cpu_f)(float), float (*f)(float), int seed) {
-    const int samples_per_block = (BLOCK_SIZE * SAMPLES_PER_THREAD);
-    const int block_num = (N + samples_per_block - 1) / samples_per_block;
-    const int n_streams = 1 + (block_num - 1) / BLOCKS_PER_STREAM;
+    
+   /* int temp = N;
+    int p = 0;
+    while (temp > 0) {
+        temp = temp / 10;
+        p++;
+    }
+    p = pow(10, p - 4);
+    p = std::min(p, 100000);
+    const int samples_per_thread = std::max(p, 1000);*/
+    const int samples_per_thread = 10000;
+
+    const int samples_per_block = (BLOCK_SIZE * samples_per_thread);
+    const int block_count = (N + samples_per_block - 1) / samples_per_block;
+    const int stream_count = 1 + (block_count - 1) / BLOCKS_PER_STREAM;
+    const int samples_per_stream = BLOCKS_PER_STREAM * BLOCK_SIZE * samples_per_thread;
+
 
     typedef std::chrono::high_resolution_clock Clock;
     cudaEvent_t start, stop;
@@ -134,12 +167,15 @@ int mh(float* x, float x0, int N, int burn_N, float (*cpu_f)(float), float (*f)(
 
     checkCudaErrors(cudaSetDevice(0));
 
-    // Do researchu, czy można to robic w ramach streamu i jak to kontrolować żeby nie zaalokować za dużo na device 
     float* dev_x;
 
     size_t free = 0, total= 0;
-
     cudaMemGetInfo(&free, &total);
+
+    const int MEMORY_POOLS_AVAILABLE = free / sizeof(float) / samples_per_stream;
+     int MEMORY_POOLS = MEMORY_POOLS_AVAILABLE * 8 / 10;
+
+    if (stream_count < MEMORY_POOLS) MEMORY_POOLS = stream_count;
 
     cudaHostRegister(x, N * sizeof(float), 0);
 
@@ -164,10 +200,10 @@ int mh(float* x, float x0, int N, int burn_N, float (*cpu_f)(float), float (*f)(
     // funkcji f, która została podana do aktualnej funkcji - coś z tym zrobić trzeba
 
 
-    int samples_pool[MAX_STREAMS_COUNT];
+    int *samples_pool;
+    cudaHostAlloc((void**)&samples_pool, stream_count * sizeof(int), 0);
     int temp_N = N;
-    const int samples_per_stream = BLOCKS_PER_STREAM * BLOCK_SIZE * SAMPLES_PER_THREAD;
-    for (int i = 0; i < n_streams; i++) {
+    for (int i = 0; i < stream_count; i++) {
         if (temp_N >= samples_per_stream) {
             samples_pool[i] = samples_per_stream;
             temp_N -= samples_per_stream;
@@ -175,28 +211,8 @@ int mh(float* x, float x0, int N, int burn_N, float (*cpu_f)(float), float (*f)(
         else {
             samples_pool[i] = temp_N;
         }
-    }// budowa wektora ilości próbek generowanej przez każdy stream
-    // TODO: można zrobić to lepiej równomiernie dystrybuując próbki 
+    }
 
-
-
-    // !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-    // Konfiguracja tej pętli jest następująco przygotowana do testów.
-    // Na samym górze pliku mamy kilka #defines, które opisują działanie pętli
-    // SAMPLES_PER_THREAD mówi o ilości próbek generowany przez pojedynczy thread 
-    // BLOCK_SIZE może być co najwyżej 256 w związku z limitem wyznaczonym przez generator liczb losowych MTGP32
-    //            w którym jeden state może być wykorzystywany wydajnie przez max 256 wątków.
-    // 
-    // Na początku tej funkcji liczone są ilości bloków i streamów, które będą użyte do obliczeń.
-    // Pierwszy jest podział na bloki, ponieważ jeden blok może wygenerować SAMPLES_PER_THREAD * BLOCK_SIZE próbek
-    // Następnie w zależności od zmiennej BLOCKS_PER_STREAM ta pula bloków jest dzielona i dostajemy ilość streamów.
-    // MAX_STREAMS_COUNT mówi jedynie o maksymalnej możliwej liczbie streamów, ponieważ statycznie alokujemy poniżej 
-    //                   pamięć na te obiekty streamów. Potem natomiast tworzymy ich tylko tyle ile zostało ich 
-    //                   policzonych w poprzednim kroku.
-    // !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!  
-
-    int MEMORY_POOLS_AVAILABLE = free / sizeof(float) / samples_per_stream;
-    int MEMORY_POOLS = MEMORY_POOLS_AVAILABLE * 8 / 10;
 
    
     checkCudaErrors(cudaMalloc((void**)&dev_x, MEMORY_POOLS * samples_per_stream * sizeof(float)));
@@ -205,10 +221,10 @@ int mh(float* x, float x0, int N, int burn_N, float (*cpu_f)(float), float (*f)(
     cudaStream_t *stream;
     cudaEvent_t *streamMemoryPoolFreeEvent;
 
-    checkCudaErrors(cudaHostAlloc((void**)&stream, n_streams * sizeof(cudaStream_t), 0));
-    checkCudaErrors(cudaHostAlloc((void**)&streamMemoryPoolFreeEvent , n_streams * sizeof(cudaEvent_t), 0));
+    checkCudaErrors(cudaHostAlloc((void**)&stream, stream_count * sizeof(cudaStream_t), 0));
+    checkCudaErrors(cudaHostAlloc((void**)&streamMemoryPoolFreeEvent , stream_count * sizeof(cudaEvent_t), 0));
     
-    for (int i = 0; i < n_streams; i++) {
+    for (int i = 0; i < stream_count; i++) {
         checkCudaErrors(cudaStreamCreateWithFlags(stream + i, cudaStreamNonBlocking));
         cudaEventCreateWithFlags(streamMemoryPoolFreeEvent + i, cudaEventDisableTiming & cudaEventBlockingSync);
     }
@@ -219,7 +235,7 @@ int mh(float* x, float x0, int N, int burn_N, float (*cpu_f)(float), float (*f)(
     mtgp32_kernel_params* devKernelParams;
 
     // Każdy blok dostaje swój generator, każdy generator może wydajnie obsłużyć max 256 wątków w ramach bloku
-    checkCudaErrors(cudaMalloc((void**)&devMTGPStates, block_num * sizeof(curandStateMtgp32)));
+    checkCudaErrors(cudaMalloc((void**)&devMTGPStates, block_count * sizeof(curandStateMtgp32)));
 
     checkCudaErrors(cudaMalloc((void**)&devKernelParams, sizeof(mtgp32_kernel_params)));
 
@@ -227,36 +243,23 @@ int mh(float* x, float x0, int N, int burn_N, float (*cpu_f)(float), float (*f)(
 
     /* Initialize one state per thread block */
     //curandMakeMTGP32KernelState(devMTGPStates,mtgp32dc_params_fast_11213, devKernelParams, block_num, seed * 117);
-    for (int i = 0; i < block_num; i++) {
+    for (int i = 0; i < block_count; i++) {
         curandMakeMTGP32KernelState(devMTGPStates + i, mtgp32dc_params_fast_11213, devKernelParams, 1, seed * 7 * i);
     }
-    //curandMakeMTGP32KernelState(devMTGPStates, mtgp32dc_params_fast_11213, devKernelParams, block_num, seed * 117);
-
     
-
    
-    for (int s = 0; s < n_streams; s++) {
+    for (int s = 0; s < stream_count; s++) {
         //if (s >= MEMORY_POOLS) checkCudaErrors(cudaEventSynchronize(streamMemoryPoolFreeEvent[s]));
         if (s >= MEMORY_POOLS) checkCudaErrors(cudaStreamWaitEvent(stream[s], streamMemoryPoolFreeEvent[s]));
-
-        dev_generate<<<BLOCKS_PER_STREAM, BLOCK_SIZE, 0, stream[s]>>>(devMTGPStates + s * BLOCKS_PER_STREAM, dev_x + s % MEMORY_POOLS * samples_per_stream, samples_pool[s], xt, std, fff);
-        checkCudaErrors(cudaMemcpyAsync(x + s * samples_per_stream, dev_x + s % MEMORY_POOLS * samples_per_stream, samples_pool[s] * sizeof(float), cudaMemcpyDeviceToHost, stream[s]));
-        if(s+MEMORY_POOLS < n_streams) checkCudaErrors(cudaEventRecord(streamMemoryPoolFreeEvent[(s+MEMORY_POOLS)], stream[s]));
+        dev_generate<<<BLOCKS_PER_STREAM, BLOCK_SIZE, 0, stream[s]>>>(devMTGPStates + s * BLOCKS_PER_STREAM, dev_x + s % MEMORY_POOLS * samples_per_stream, samples_pool[s], xt, std,samples_per_thread, fff);
+        checkCudaErrors(cudaMemcpyAsync(x + s * samples_per_stream, dev_x + (s % MEMORY_POOLS) * samples_per_stream, samples_pool[s] * sizeof(float), cudaMemcpyDeviceToHost, stream[s]));
+        if(s+MEMORY_POOLS < stream_count) checkCudaErrors(cudaEventRecord(streamMemoryPoolFreeEvent[(s+MEMORY_POOLS)], stream[s]));
     }
-
-
-    // for kernel time measurement in case of 1 stream
-    // checkCudaErrors(cudaGetLastError());
-    // checkCudaErrors(cudaEventRecord(stop, 0));
-    // checkCudaErrors(cudaEventSynchronize(stop));
-    // checkCudaErrors(cudaEventElapsedTime(&elapsedTime, start, stop));
-    // checkCudaErrors(cudaEventDestroy(start));
-    // checkCudaErrors(cudaEventDestroy(stop));
 
 
     checkCudaErrors(cudaGetLastError());
     checkCudaErrors(cudaDeviceSynchronize());
-    for (int s = 0; s < n_streams; s++) {
+    for (int s = 0; s < stream_count; s++) {
         checkCudaErrors(cudaStreamDestroy(stream[s]));
     }
     Clock::time_point t1 = Clock::now();
