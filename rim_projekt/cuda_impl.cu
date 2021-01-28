@@ -205,7 +205,7 @@ int mh(float* x, float x0, int N, int burn_N, float (*cpu_f)(float), float (*f)(
     /* Initialize one state per thread block */
     //curandMakeMTGP32KernelState(devMTGPStates,mtgp32dc_params_fast_11213, devKernelParams, block_num, seed * 117);
     for (int i = 0; i < block_count; i++) {
-        curandMakeMTGP32KernelState(devMTGPStates + i, mtgp32dc_params_fast_11213, devKernelParams, 1, seed * 7 * i);
+        curandMakeMTGP32KernelState(devMTGPStates + i, mtgp32dc_params_fast_11213, devKernelParams, 1, seed * 7907 * i);
     }
     
    
