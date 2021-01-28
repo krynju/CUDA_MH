@@ -15,15 +15,10 @@
 #include <curand_mtgp32dc_p_11213.h>
 #include <curand_kernel.h>
 
-//#define SAMPLES_PER_THREAD 100000
-// Samples per thread should be at most
-// 10^3 for 10^6 samples
-// 10^4 for 10^7 samples
-// 10^5 for 10^8 samples
- 
+
 #define BLOCK_SIZE 256
 #define BLOCKS_PER_STREAM 1
-#define MAX_STREAMS_COUNT 64
+
 
 // CPU CODE FOR STD TUNING 
 
@@ -92,19 +87,6 @@ __global__ void dev_generate(curandStateMtgp32* state, float* x, int x_len, floa
 
     float f_xt = f(xt);
 
-    // new starting point for each thread
-    for (int t = 0; t < 1000; t++) {
-        float xc = xt + curand_normal(&state[blockIdx.x]) * std / 4.0f ;
-        float f_xc = f(xc);
-        float a = f_xc / f_xt;
-        float u = curand_uniform(&state[blockIdx.x]);
-
-        if (u <= a) {
-            xt = xc;
-            f_xt = f_xc;
-        }
-    }
-
     for (int t = warp_range_start; t < warp_range_end  ; t+=32) {
         float xc = xt + curand_normal(&state[blockIdx.x])*std ;
         float f_xc = f(xc);
@@ -116,29 +98,8 @@ __global__ void dev_generate(curandStateMtgp32* state, float* x, int x_len, floa
             f_xt = f_xc;
         }
         x[t + id_in_warp] = xt;
-        // W tej pętli każdy wątek w ramach warpu pisze do co 32 adresu w pamięci, żeby lepiej grupować 
-        // transfery pamięci
-        // TODO: Do porównania z poniższą zakomentowaną wersją, gdzie każdy wątek pisze do swojego przedziału
+
     }
-
-
-    // int i = SAMPLES_PER_THREAD * BLOCK_SIZE * blockIdx.x   + threadIdx.x * SAMPLES_PER_THREAD;
-    // int sstart_range = i ;
-    // int eend_range= i + SAMPLES_PER_THREAD;
-    // float f_xt = f(xt);
-    // if (eend_range > x_len) { eend_range = x_len; }
-    // for (int t = sstart_range; t < eend_range  ; t++) {
-    //     float xc = xt + curand_normal(&state[blockIdx.x])*std ;
-    //     float f_xc = f(xc);
-    //     float a = f_xc / f_xt;
-    //     float u = curand_uniform(&state[blockIdx.x]);
-  
-    //     if (u <= a) {
-    //         xt = xc;
-    //         f_xt = f_xc;
-    //     }
-    //     x[t] = xt;
-    // }
 }
 
 int mh(float* x, float x0, int N, int burn_N, float (*cpu_f)(float), float (*f)(float), int seed) {
@@ -154,6 +115,12 @@ int mh(float* x, float x0, int N, int burn_N, float (*cpu_f)(float), float (*f)(
     const int samples_per_thread = std::max(p, 1000);*/
     const int samples_per_thread = 10000;
 
+    // Samples per thread should be at most
+    // 10^3 for 10^6 samples
+    // 10^4 for 10^7 samples
+    // 10^5 for 10^8 samples
+
+
     const int samples_per_block = (BLOCK_SIZE * samples_per_thread);
     const int block_count = (N + samples_per_block - 1) / samples_per_block;
     const int stream_count = 1 + (block_count - 1) / BLOCKS_PER_STREAM;
@@ -161,8 +128,7 @@ int mh(float* x, float x0, int N, int burn_N, float (*cpu_f)(float), float (*f)(
 
 
     typedef std::chrono::high_resolution_clock Clock;
-    cudaEvent_t start, stop;
-    float elapsedTime;
+  
     Clock::time_point t0 = Clock::now();
 
     checkCudaErrors(cudaSetDevice(0));
@@ -173,7 +139,7 @@ int mh(float* x, float x0, int N, int burn_N, float (*cpu_f)(float), float (*f)(
     cudaMemGetInfo(&free, &total);
 
     const int MEMORY_POOLS_AVAILABLE = free / sizeof(float) / samples_per_stream;
-     int MEMORY_POOLS = MEMORY_POOLS_AVAILABLE * 8 / 10;
+    int MEMORY_POOLS = MEMORY_POOLS_AVAILABLE * 8 / 10;
 
     if (stream_count < MEMORY_POOLS) MEMORY_POOLS = stream_count;
 
@@ -192,16 +158,12 @@ int mh(float* x, float x0, int N, int burn_N, float (*cpu_f)(float), float (*f)(
     std = std::get<1>(res);
 
 
-
-
     float (*fff)(float);
     checkCudaErrors(cudaMemcpyFromSymbol(&fff, dev_ff_p, sizeof(f)));
-    // TODO: tutaj jest problem, że nie można podać do cudaMemcpyFromSymbol na drugi arg
-    // funkcji f, która została podana do aktualnej funkcji - coś z tym zrobić trzeba
 
 
     int *samples_pool;
-    cudaHostAlloc((void**)&samples_pool, stream_count * sizeof(int), 0);
+    checkCudaErrors(cudaHostAlloc((void**)&samples_pool, stream_count * sizeof(int), 0));
     int temp_N = N;
     for (int i = 0; i < stream_count; i++) {
         if (temp_N >= samples_per_stream) {
@@ -217,7 +179,6 @@ int mh(float* x, float x0, int N, int burn_N, float (*cpu_f)(float), float (*f)(
    
     checkCudaErrors(cudaMalloc((void**)&dev_x, MEMORY_POOLS * samples_per_stream * sizeof(float)));
 
-
     cudaStream_t *stream;
     cudaEvent_t *streamMemoryPoolFreeEvent;
 
@@ -226,7 +187,7 @@ int mh(float* x, float x0, int N, int burn_N, float (*cpu_f)(float), float (*f)(
     
     for (int i = 0; i < stream_count; i++) {
         checkCudaErrors(cudaStreamCreateWithFlags(stream + i, cudaStreamNonBlocking));
-        cudaEventCreateWithFlags(streamMemoryPoolFreeEvent + i, cudaEventDisableTiming & cudaEventBlockingSync);
+        checkCudaErrors(cudaEventCreateWithFlags(streamMemoryPoolFreeEvent + i, cudaEventDisableTiming & cudaEventBlockingSync));
     }
 
     // Używamy generatora MTGP32, mamy do porównania wersje zaimplementowane na CPU sekwencyjnie i równolegle i
@@ -266,12 +227,10 @@ int mh(float* x, float x0, int N, int burn_N, float (*cpu_f)(float), float (*f)(
 
     auto d = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0);
 
-    // for kernel time measurement
-    // printf("Kernel-only time: %f ms\n", elapsedTime);
     printf("All time %d ms \n", d.count());
  
     checkCudaErrors(cudaFree(dev_x));
-    cudaHostUnregister(x);
+    checkCudaErrors(cudaHostUnregister(x));
 
     return 0;
 }
