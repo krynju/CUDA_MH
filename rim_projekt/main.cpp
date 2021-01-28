@@ -9,7 +9,7 @@
 
 
 
-#define save_result true
+#define save_result false
 
 #define use_matlab false
 
