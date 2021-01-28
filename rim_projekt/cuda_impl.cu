@@ -113,7 +113,7 @@ int mh(float* x, float x0, int N, int burn_N, float (*cpu_f)(float), float (*f)(
     p = pow(10, p - 4);
     p = std::min(p, 100000);
     const int samples_per_thread = std::max(p, 1000);*/
-    const int samples_per_thread = 10000;
+    const int samples_per_thread = 100000;
 
     // Samples per thread should be at most
     // 10^3 for 10^6 samples
